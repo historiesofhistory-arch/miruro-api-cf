@@ -67,6 +67,10 @@ class CFCookie:
     user_agent: str
     captured_at: float
     expires_at: float  # cf_clearance typically lasts ~30 min
+    # Browser client hints captured alongside the UA — Cloudflare validates
+    # that these match the User-Agent. Mismatch = instant 403.
+    sec_ch_ua: str = ""
+    sec_ch_ua_platform: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -75,6 +79,8 @@ class CFCookie:
             "captured_at": self.captured_at,
             "expires_at": self.expires_at,
             "is_expired": time.time() > self.expires_at,
+            "sec_ch_ua": self.sec_ch_ua,
+            "sec_ch_ua_platform": self.sec_ch_ua_platform,
         }
 
 
@@ -210,7 +216,7 @@ class CFSolver:
             )
 
         # botasaurus uses a decorator pattern; wrap a function we can call
-        captured = {"cookie": None, "ua": None}
+        captured = {"cookie": None, "ua": None, "sec_ch_ua": "", "sec_ch_ua_platform": ""}
 
         @browser(headless=False, profile="cf-solver", close_on_crash=False, block_images=True)
         def _solve(driver: Driver, url: str):
@@ -234,9 +240,36 @@ class CFSolver:
                 if cf:
                     self._log(f"cf_clearance captured after {i+1}s")
                     captured["cookie"] = cf[0]["value"]
+                    # Capture all the client-hint headers Cloudflare expects
+                    # to match the User-Agent. Mismatch = instant 403.
                     try:
-                        captured["ua"] = driver.run_js("return navigator.userAgent;")
-                    except Exception:
+                        ua_data = driver.run_js("""
+                            return {
+                                ua: navigator.userAgent,
+                                sec_ch_ua: navigator.userAgentData ?
+                                    navigator.userAgentData.brands.map(b => '"' + b.brand + '";v="' + b.version + '"').join(', ')
+                                    : '',
+                                platform: navigator.userAgentData ?
+                                    navigator.userAgentData.platform
+                                    : (navigator.platform || 'Linux')
+                            };
+                        """)
+                        if ua_data:
+                            captured["ua"] = ua_data.get("ua")
+                            captured["sec_ch_ua"] = ua_data.get("sec_ch_ua") or ""
+                            # Normalize platform: "Windows" / "macOS" / "Linux"
+                            p = (ua_data.get("platform") or "").lower()
+                            if "win" in p:
+                                captured["sec_ch_ua_platform"] = "Windows"
+                            elif "mac" in p:
+                                captured["sec_ch_ua_platform"] = "macOS"
+                            else:
+                                captured["sec_ch_ua_platform"] = "Linux"
+                        self._log(f"UA: {captured['ua']}")
+                        self._log(f"sec-ch-ua: {captured['sec_ch_ua']}")
+                        self._log(f"sec-ch-ua-platform: {captured['sec_ch_ua_platform']}")
+                    except Exception as e:
+                        self._log(f"UA capture error: {e}")
                         captured["ua"] = (
                             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
@@ -274,6 +307,8 @@ class CFSolver:
             ),
             captured_at=time.time(),
             expires_at=time.time() + self.COOKIE_TTL_SECONDS,
+            sec_ch_ua=captured.get("sec_ch_ua", ""),
+            sec_ch_ua_platform=captured.get("sec_ch_ua_platform", ""),
         )
 
     def _log(self, msg: str) -> None:

@@ -48,15 +48,38 @@ MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
 def _build_headers() -> dict:
     """
     Return a fresh copy of HEADERS, patched with the stored cf_clearance
-    cookie + matching user-agent if we have one. Otherwise return the
-    default headers (which will hit Cloudflare's 403 on datacenter IPs).
+    cookie + the EXACT User-Agent, sec-ch-ua, and sec-ch-ua-platform that
+    the browser used when it captured the cookie.
+
+    Cloudflare validates that all client-hint headers (sec-ch-ua,
+    sec-ch-ua-platform, sec-ch-ua-mobile) match the User-Agent. A mismatch
+    between User-Agent=Chrome/151 and sec-ch-ua="Chrome";v="110" is a
+    classic bot-detection signal that results in 403 — even with a valid
+    cf_clearance cookie.
     """
     h = dict(HEADERS)
     cookie = cf_store.get()
     if cookie and time.time() <= cookie.expires_at:
         h["User-Agent"] = cookie.user_agent
         h["Cookie"] = f"cf_clearance={cookie.value}"
+        # Override client hints to match the captured UA — these MUST match
+        if cookie.sec_ch_ua:
+            h["sec-ch-ua"] = cookie.sec_ch_ua
+        if cookie.sec_ch_ua_platform:
+            h["sec-ch-ua-platform"] = f'"{cookie.sec_ch_ua_platform}"'
     return h
+
+
+def _headers_debug() -> dict:
+    """Return a sanitized view of _build_headers() for the /cf/test endpoint.
+    Hides the actual cookie value but shows everything else for debugging."""
+    h = _build_headers()
+    out = dict(h)
+    if "Cookie" in out:
+        # Show first 30 chars + length so the user can verify it's being attached
+        c = out["Cookie"]
+        out["Cookie"] = c[:40] + f"... (length={len(c)})"
+    return out
 
 def _proxy_img(url: str) -> str:
     return url
@@ -440,9 +463,12 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
         <button class="cf-btn primary" id="cf-get-btn" onclick="cfGet()">▶ Get CF Cookie</button>
         <button class="cf-btn danger" id="cf-stop-btn" onclick="cfStop()" disabled>■ Stop Browser</button>
         <button class="cf-btn warn" id="cf-clear-btn" onclick="cfClear()">✕ Forget Cookie</button>
+        <button class="cf-btn" id="cf-test-btn" onclick="cfTest()" style="background:rgba(56,189,248,.1);color:var(--blue);border-color:rgba(56,189,248,.25)">🧪 Test Cookie</button>
       </div>
 
       <div class="cf-log" id="cf-log"></div>
+
+      <div id="cf-test-result" style="margin-top:12px;display:none"></div>
 
       <details class="cf-collapse">
         <summary>Manual paste (advanced — if auto-bypass fails in your env)</summary>
@@ -707,8 +733,10 @@ async function cfRefresh(){
     if (cookie.has_cookie){
       const remain = cookie.seconds_remaining || 0;
       const mins = Math.floor(remain/60), secs = remain%60;
-      info.innerHTML = `<b>Cookie:</b> <span class="val">${cookie.value_preview||''}</span><br>
-        <b>User-Agent:</b> <span class="val">${(cookie.user_agent||'').slice(0,80)}…</span><br>
+      info.innerHTML = `<b>Cookie:</b> <span class="val">${cookie.value_preview||''}</span> <span style="color:var(--dim);font-size:.9em">(length=${cookie.value_length||'?'})</span><br>
+        <b>User-Agent:</b> <span class="val" style="font-size:.85em">${(cookie.user_agent||'').slice(0,100)}</span><br>
+        <b>sec-ch-ua:</b> <span class="val" style="font-size:.85em">${cookie.sec_ch_ua||'<span style="color:#ef4444">NOT CAPTURED — re-capture cookie</span>'}</span><br>
+        <b>sec-ch-ua-platform:</b> <span class="val">${cookie.sec_ch_ua_platform||'<span style="color:#ef4444">NOT CAPTURED</span>'}</span><br>
         <b>Expires in:</b> <span class="val">${mins}m ${secs}s</span> ${cookie.is_expired?'<span style="color:#ef4444">(expired)</span>':'<span style="color:var(--green)">(live)</span>'}`;
       clearBtn.disabled = false;
     } else {
@@ -768,6 +796,40 @@ async function cfManual(){
   }catch(e){alert('Error: '+e.message)}
 }
 
+async function cfTest(){
+  const result = document.getElementById('cf-test-result');
+  result.style.display = 'block';
+  result.innerHTML = '<div class="cf-info">🧪 Testing cookie against miruro.tv/api/secure/pipe…</div>';
+  try{
+    const r = await fetch('/cf/test');
+    const d = await r.json();
+    if (d.error && !d.request_headers){
+      result.innerHTML = `<div class="cf-info" style="border-color:rgba(239,68,68,.3)"><b>❌ Error:</b> ${d.error}</div>`;
+      return;
+    }
+    const ok = d.ok;
+    const color = ok ? 'var(--green)' : '#ef4444';
+    const emoji = ok ? '✅' : '❌';
+    let html = `<div class="cf-info" style="border-color:${color}40">
+      <div style="color:${color};font-weight:600;font-size:1.05em;margin-bottom:10px">${emoji} Response: HTTP ${d.response_status||'?'}</div>
+      <b>Diagnosis:</b> <span style="color:${color}">${d.diagnosis||''}</span><br><br>
+      <b>Request URL:</b><br><span class="val" style="font-size:.7em;word-break:break-all">${d.request_url||''}</span><br><br>
+      <b>Request headers sent to Cloudflare:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.72em;color:#a5b4fc;margin-top:6px;white-space:pre-wrap;word-break:break-all">${JSON.stringify(d.request_headers, null, 2)}</pre>
+    `;
+    if (d.response_headers){
+      html += `<br><b>Response headers from Cloudflare:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.72em;color:#94a3b8;margin-top:6px;white-space:pre-wrap">${JSON.stringify(d.response_headers, null, 2)}</pre>`;
+    }
+    if (d.response_body_preview){
+      const isChallenge = d.response_is_cloudflare_challenge;
+      html += `<br><b>Response body preview ${isChallenge?'<span style="color:#fbbf24">(Cloudflare challenge page!)</span>':''}:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.7em;color:#94a3b8;margin-top:6px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all">${(d.response_body_preview||'').replace(/</g,'&lt;')}</pre>`;
+    }
+    html += `</div>`;
+    result.innerHTML = html;
+  }catch(e){
+    result.innerHTML = `<div class="cf-info" style="border-color:#ef444440"><b>❌ Network error:</b> ${e.message}</div>`;
+  }
+}
+
 // initial load
 cfRefresh();
 </script>
@@ -780,6 +842,8 @@ cfRefresh();
 class ManualCFPayload(BaseModel):
     value: str
     user_agent: str = ""
+    sec_ch_ua: str = ""
+    sec_ch_ua_platform: str = ""
 
 
 @app.post("/cf/get")
@@ -822,7 +886,12 @@ async def cf_manual(payload: ManualCFPayload):
     """Paste a cf_clearance cookie you captured in your own browser."""
     if not payload.value or len(payload.value) < 20:
         raise HTTPException(status_code=400, detail="value looks invalid (too short)")
-    cf_store.set_manual(payload.value, payload.user_agent)
+    cf_store.set_manual(
+        payload.value,
+        payload.user_agent,
+        payload.sec_ch_ua,
+        payload.sec_ch_ua_platform,
+    )
     return {"ok": True, "cookie": cf_store.status()}
 
 
@@ -831,6 +900,107 @@ async def cf_clear():
     """Forget the stored cookie."""
     cf_store.clear()
     return {"ok": True, "cookie": cf_store.status()}
+
+
+@app.get("/cf/test")
+async def cf_test():
+    """
+    Live test: fetch the miruro.tv pipe endpoint with the stored cookie and
+    return the EXACT request headers + response status + response body.
+
+    Use this to debug 403 errors. If the request_headers show a Cookie is
+    attached but the response is still 403, then either:
+      1. The cookie is expired or invalidated by Cloudflare (re-capture it)
+      2. The User-Agent / sec-ch-ua don't match what the browser used
+      3. Your IP is on Cloudflare's datacenter blocklist
+    """
+    cookie = cf_store.get()
+    if not cookie:
+        return {
+            "ok": False,
+            "error": "No cookie stored. Click 'Get CF Cookie' first.",
+            "cookie_status": cf_store.status(),
+        }
+
+    if time.time() > cookie.expires_at:
+        return {
+            "ok": False,
+            "error": "Cookie is expired. Click 'Get CF Cookie' to refresh.",
+            "cookie_status": cf_store.status(),
+        }
+
+    # Build the EXACT headers that /episodes/{id} will use
+    headers = _build_headers()
+    # Make a real pipe request (anilist_id=1 — same as /episodes/1)
+    payload = {
+        "path": "episodes",
+        "method": "GET",
+        "query": {"anilistId": 1},
+        "body": None,
+        "version": "0.1.0",
+    }
+    encoded_req = _encode_pipe_request(payload)
+    url = f"{MIRURO_PIPE_URL}?e={encoded_req}"
+
+    # Sanitize headers for display (don't leak the full cookie value)
+    display_headers = dict(headers)
+    if "Cookie" in display_headers:
+        c = display_headers["Cookie"]
+        display_headers["Cookie"] = c[:40] + f"... (total length={len(c)})"
+
+    try:
+        async with AsyncSession(impersonate="chrome110") as client:
+            res = await client.get(url, headers=headers)
+            # Identify the response type
+            is_cf_challenge = "Just a moment" in res.text or "challenge-platform" in res.text
+            return {
+                "ok": res.status_code == 200,
+                "request_url": url,
+                "request_headers": display_headers,
+                "response_status": res.status_code,
+                "response_is_cloudflare_challenge": is_cf_challenge,
+                "response_body_preview": res.text[:800],
+                "response_headers": {
+                    k: v for k, v in dict(res.headers).items()
+                    if k.lower() in ("server", "cf-ray", "cf-cache-status", "content-type",
+                                     "set-cookie", "cf-mitigated", "cf-chl-bypass")
+                },
+                "cookie_status": cf_store.status(),
+                "diagnosis": _diagnose_403(res.status_code, is_cf_challenge, headers, cookie),
+            }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "request_headers": display_headers,
+            "cookie_status": cf_store.status(),
+        }
+
+
+def _diagnose_403(status: int, is_cf_challenge: bool, headers: dict, cookie) -> str:
+    """Return a human-readable diagnosis of why we got 403."""
+    if status == 200:
+        return "✅ Request succeeded — cookie is valid and being used correctly."
+    if status != 403:
+        return f"Got status {status} — check the response body for details."
+    if "Cookie" not in headers:
+        return "❌ No Cookie header attached. The cookie store returned None — click 'Get CF Cookie'."
+    if is_cf_challenge:
+        return ("⚠️ Cloudflare returned its challenge page (not the pipe response). "
+                "This means the cookie was either: (a) captured by a botasaurus bypass that "
+                "Cloudflare detected, OR (b) bound to a different TLS fingerprint than curl_cffi "
+                "is using. Try the 'Manual paste' option with a cookie from your own browser.")
+    # 403 but not the challenge page — could be the cookie was rejected for another reason
+    ua = headers.get("User-Agent", "")
+    sec_ch_ua = headers.get("sec-ch-ua", "")
+    if "Chrome/110" in ua and "151" not in ua:
+        return ("❌ User-Agent says Chrome/110 but the cookie was captured by Chrome/151. "
+                "Mismatch — re-capture the cookie or use Manual paste.")
+    if "v=\"110\"" in sec_ch_ua and "Chrome/151" in ua:
+        return ("❌ sec-ch-ua header says Chrome 110 but User-Agent says Chrome 151. "
+                "Mismatch — re-capture the cookie so sec-ch-ua is updated.")
+    return ("❌ Cloudflare rejected the request. The cookie may be tainted (botasaurus bypass "
+            "detected) or bound to a different TLS fingerprint. Try Manual paste.")
 
 
 @app.get("/search")

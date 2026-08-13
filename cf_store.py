@@ -44,9 +44,36 @@ class CFStore:
             self._cookie = None
             self._save_to_disk()
 
-    def set_manual(self, value: str, user_agent: str = "") -> None:
+    def set_manual(
+        self,
+        value: str,
+        user_agent: str = "",
+        sec_ch_ua: str = "",
+        sec_ch_ua_platform: str = "",
+    ) -> None:
         """Allow a user to paste a cf_clearance they captured in their own browser."""
         from cf_solver import CFSolver
+        # If user_agent contains Chrome/<version>, derive sec_ch_ua from it
+        # so the user doesn't have to paste it manually.
+        derived_sec_ch_ua = sec_ch_ua
+        derived_platform = sec_ch_ua_platform
+        if not derived_sec_ch_ua and user_agent:
+            import re
+            m = re.search(r"Chrome/(\d+)", user_agent)
+            if m:
+                v = m.group(1)
+                derived_sec_ch_ua = (
+                    f'"Chromium";v="{v}", "Not_A Brand";v="24", '
+                    f'"Google Chrome";v="{v}"'
+                )
+        if not derived_platform and user_agent:
+            ua_l = user_agent.lower()
+            if "windows" in ua_l:
+                derived_platform = "Windows"
+            elif "mac" in ua_l or "darwin" in ua_l:
+                derived_platform = "macOS"
+            else:
+                derived_platform = "Linux"
         cookie = CFCookie(
             value=value.strip(),
             user_agent=user_agent.strip() or (
@@ -55,6 +82,8 @@ class CFStore:
             ),
             captured_at=time.time(),
             expires_at=time.time() + CFSolver.COOKIE_TTL_SECONDS,
+            sec_ch_ua=derived_sec_ch_ua,
+            sec_ch_ua_platform=derived_platform,
         )
         self.set(cookie)
 
@@ -65,7 +94,10 @@ class CFStore:
         return {
             "has_cookie": True,
             "value_preview": c.value[:24] + "…" if len(c.value) > 24 else c.value,
+            "value_length": len(c.value),
             "user_agent": c.user_agent,
+            "sec_ch_ua": c.sec_ch_ua,
+            "sec_ch_ua_platform": c.sec_ch_ua_platform,
             "captured_at": c.captured_at,
             "expires_at": c.expires_at,
             "is_expired": time.time() > c.expires_at,
@@ -83,6 +115,8 @@ class CFStore:
                         "user_agent": self._cookie.user_agent,
                         "captured_at": self._cookie.captured_at,
                         "expires_at": self._cookie.expires_at,
+                        "sec_ch_ua": self._cookie.sec_ch_ua,
+                        "sec_ch_ua_platform": self._cookie.sec_ch_ua_platform,
                     }, f)
             else:
                 if os.path.exists(_STORE_PATH):
@@ -101,6 +135,8 @@ class CFStore:
                 user_agent=data["user_agent"],
                 captured_at=data["captured_at"],
                 expires_at=data["expires_at"],
+                sec_ch_ua=data.get("sec_ch_ua", ""),
+                sec_ch_ua_platform=data.get("sec_ch_ua_platform", ""),
             )
         except Exception:
             self._cookie = None
