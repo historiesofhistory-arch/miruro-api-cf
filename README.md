@@ -25,37 +25,46 @@ The API uses **`curl_cffi`** with Chrome TLS fingerprinting and proper same-orig
 
 ---
 
-## 🛡️ Cloudflare Bypass Panel (New in v3.0)
+## 🛡️ Cloudflare Bypass (ViperTLS — v3.1)
 
-The homepage now has a **"Cloudflare Bypass"** panel with three buttons:
+The API uses **ViperTLS** for Cloudflare bypass — the same approach used by the working [anime-api](https://github.com/historiesofhistory-arch/anime-api) reference implementation. ViperTLS handles both:
 
-| Button | What it does |
-|---|---|
-| **▶ Get CF Cookie** | Launches a real Google Chrome (via `botasaurus`) in the background, navigates to `miruro.tv`, solves Cloudflare's challenge, and captures the `cf_clearance` cookie + the User-Agent that earned it. Saved to disk so it survives restarts. |
-| **■ Stop Browser** | Kills the background browser process immediately. Use this as soon as the cookie is captured — the API stays lightweight afterwards. |
-| **✕ Forget Cookie** | Clears the stored cookie (forces re-fetch on next `/episodes` call). |
+1. **TLS fingerprinting** (pure-Python JA3/JA4/HTTP2 frame order) — for normal requests, no browser needed
+2. **Browser-based challenge solve** — automatically escalates to a real Chromium when Cloudflare returns a challenge page
+
+The `cf_clearance` cookie is bound to the **same TLS session** that solved the challenge — eliminating the fingerprint mismatch that caused 403 errors with the previous botasaurus+curl_cffi split.
 
 ### How it works
 
-1. Click **Get CF Cookie** → a real Chrome opens in the background (uses Xvfb on Linux servers, no display needed)
-2. Watch the live log on the homepage — it shows browser progress (`Loaded: Just a moment...` → `cf_clearance captured after 1s`)
-3. Once captured, the cookie is used automatically for all `/episodes/{id}`, `/sources`, and `/watch/{...}` requests
-4. Click **Stop Browser** to kill the browser process — the API stays lightweight, using `curl_cffi` with the saved cookie for all subsequent requests
-5. The cookie lasts ~25 minutes; when it expires, just click **Get CF Cookie** again
+- On server startup, a persistent `vipertls.AsyncClient` is created with the `chrome_145` preset
+- A background warmup task navigates to `miruro.tv/` — ViperTLS solves the CF challenge (headless Chromium, ~30-60s on first run) and caches the `cf_clearance` cookie
+- All subsequent `/episodes`, `/sources`, `/watch` requests reuse this session — **no browser overhead, just HTTP requests**
+- If the cookie expires (CF returns 403), one request triggers a re-solve under a lock; concurrent requests wait for it
 
-### Manual fallback
+### Homepage panel
 
-If the auto-bypass fails in your environment (e.g. very strict CF WAF on your IP), the panel has a **"Manual paste"** section. Open `miruro.tv` in your own browser, solve the challenge, then copy the `cf_clearance` cookie value from DevTools → Application → Cookies and paste it into the panel.
+The homepage has a "Cloudflare Bypass (ViperTLS)" panel showing:
+- ViperTLS solver status (last solve, solve count, failures)
+- **🔥 Re-solve CF** button — force a fresh challenge solve
+- **🧪 Test Pipe** button — live test of the pipe endpoint
+- Manual paste fallback (for environments where vipertls's browser solver fails)
 
 ### API endpoints
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/cf/get` | POST | Launch the browser to fetch a fresh `cf_clearance` |
-| `/cf/status` | GET | Combined view of solver state + stored cookie state |
-| `/cf/stop` | POST | Kill any running browser process |
-| `/cf/manual` | POST | Manually paste a `cf_clearance` value (body: `{value, user_agent?}`) |
-| `/cf/token` | DELETE | Forget the stored cookie |
+| `/cf/status` | GET | Show ViperTLS solver state + any manual cookie |
+| `/cf/warmup` | POST | Force a re-solve of the CF challenge |
+| `/cf/test` | GET | Live test of the pipe endpoint via ViperTLS |
+| `/cf/manual` | POST | Manually paste a `cf_clearance` (fallback only) |
+| `/cf/token` | DELETE | Forget the manual cookie |
+
+### Deployment requirements
+
+- **VPS with a clean IP** (DigitalOcean, Hetzner, Linode, Vultr) — recommended
+- **Local machine** — works great
+- ❌ **Vercel, Render free, Railway** — datacenter IPs are CF-blocked; the browser solver will fail
+- The Dockerfile installs Chromium + Xvfb automatically via `playwright install-deps` + `vipertls install-browsers`
 
 ---
 
