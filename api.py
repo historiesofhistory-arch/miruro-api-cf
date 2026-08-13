@@ -1,5 +1,4 @@
-import base64, json, gzip, httpx, os, time
-from curl_cffi.requests import AsyncSession
+import base64, json, gzip, httpx, os, time, asyncio
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,12 +6,29 @@ from typing import Optional
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from cf_solver import solver as cf_solver
+# ── ViperTLS for Cloudflare bypass ──────────────────────────────────
+# ViperTLS handles BOTH the TLS fingerprinting (JA3/JA4/HTTP2 frame order,
+# pure-Python, no browser) AND automatically escalates to a real Chromium
+# solve when TLS alone isn't enough. The cf_clearance cookie is bound to
+# the SAME TLS session that solved the challenge — so no fingerprint
+# mismatch like we had with curl_cffi + botasaurus.
+#
+# Pin VIPERTLS_HOME so the browser binary is found regardless of how
+# uvicorn is launched.
+os.environ.setdefault(
+    "VIPERTLS_HOME",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "vipertls"),
+)
+import vipertls
+
+# Legacy cookie store — kept for the manual-paste fallback (in case
+# vipertls's solver fails on a given deployment, the user can still
+# paste a cf_clearance they captured in their own browser).
 from cf_store import store as cf_store
 
 load_dotenv()
 
-app = FastAPI(title="Miruro API", version="3.0")
+app = FastAPI(title="Miruro API", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -22,64 +38,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
-)
+# ── In-memory TTL cache ─────────────────────────────────────────────
+# Zero deps, asyncio-safe (single event loop). Stream/watch URLs are
+# intentionally NOT cached — CDN signed URLs expire in minutes.
+_cache: dict = {}
 
-HEADERS = {
-    "User-Agent": BASE_USER_AGENT,
+def _cache_get(key: str):
+    entry = _cache.get(key)
+    if entry and time.monotonic() < entry[0]:
+        return entry[1]
+    return None
+
+def _cache_set(key: str, value, ttl: int) -> None:
+    _cache[key] = (time.monotonic() + ttl, value)
+
+_TTL_SHORT   = 300   # 5 min  — search, suggestions, recent
+_TTL_MEDIUM  = 600   # 10 min — trending, popular, upcoming, schedule
+_TTL_LONG    = 1800  # 30 min — info, episodes
+_TTL_XLONG   = 3600  # 1 hr   — characters, relations, recommendations
+
+# ── Headers for pipe requests (vipertls adds User-Agent + sec-ch-ua
+# automatically based on the impersonate preset) ────────────────────
+_PIPE_HEADERS = {
     "Referer": "https://www.miruro.tv/",
-    "Origin": "https://www.miruro.tv",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
-    "sec-ch-ua": '"Chromium";v="110", "Not A(Brand";v="24", "Google Chrome";v="110"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
+    "Origin":  "https://www.miruro.tv",
+    "Accept":  "*/*",
+    "Accept-Language":  "en-US,en;q=0.9",
+    "sec-fetch-site":   "same-origin",
+    "sec-fetch-mode":   "cors",
+    "sec-fetch-dest":   "empty",
+    "Priority": "u=1, i",
 }
-ANILIST_URL = "https://graphql.anilist.co"
+
+ANILIST_URL    = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
 
+_WARMUP_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
-def _build_headers() -> dict:
+# ── Persistent ViperTLS session ─────────────────────────────────────
+# One client lives for the lifetime of the server process.  The CF
+# clearance cookie is obtained once at startup (headless Chromium solve,
+# ~30-60s on first run, instant on subsequent runs via cookie cache) and
+# then reused for every subsequent pipe request with zero browser overhead.
+# If the cookie expires Cloudflare returns 403; we catch that, re-solve
+# once under a lock (so concurrent requests don't spawn multiple solves),
+# and retry.  On typical Cloudflare configs the clearance lasts 1–24 hours.
+_pipe_client: "vipertls.AsyncClient | None" = None
+_warmup_lock: asyncio.Lock = asyncio.Lock()
+_solver_status: dict = {
+    "last_solve": None,
+    "last_solve_at": 0.0,
+    "solve_count": 0,
+    "fail_count": 0,
+    "last_failure_reason": None,
+}
+
+
+async def _do_warmup() -> bool:
+    """Run the CF challenge solve on the main domain.
+    Returns True if warmup succeeded (got 200), False otherwise."""
+    global _solver_status
+    try:
+        r = await _pipe_client.get("https://www.miruro.tv/", headers=_WARMUP_HEADERS)
+        ok = r.status_code == 200
+        solved_by = getattr(r, "solved_by", "unknown")
+        _solver_status["last_solve"] = f"{'ok' if ok else 'fail'} ({solved_by})"
+        _solver_status["last_solve_at"] = time.time()
+        _solver_status["solve_count"] += 1
+        if not ok:
+            _solver_status["fail_count"] += 1
+            reason = r.headers.get("x-vipertls-failure-reason", "unknown")
+            _solver_status["last_failure_reason"] = reason
+        return ok
+    except Exception as e:
+        _solver_status["fail_count"] += 1
+        _solver_status["last_failure_reason"] = str(e)
+        _solver_status["last_solve_at"] = time.time()
+        return False
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _pipe_client
+    _pipe_client = vipertls.AsyncClient(
+        impersonate="chrome_145",
+        timeout=90,
+        follow_redirects=True,
+    )
+    # Warm up in background so the API is responsive immediately.
+    # The first /episodes request will wait on the lock if warmup is
+    # still running.
+    asyncio.create_task(_do_warmup())
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    if _pipe_client:
+        try:
+            await _pipe_client.aclose()
+        except Exception:
+            pass
+
+
+async def _pipe_get(url: str) -> str:
     """
-    Return a fresh copy of HEADERS, patched with the stored cf_clearance
-    cookie + the EXACT User-Agent, sec-ch-ua, and sec-ch-ua-platform that
-    the browser used when it captured the cookie.
-
-    Cloudflare validates that all client-hint headers (sec-ch-ua,
-    sec-ch-ua-platform, sec-ch-ua-mobile) match the User-Agent. A mismatch
-    between User-Agent=Chrome/151 and sec-ch-ua="Chrome";v="110" is a
-    classic bot-detection signal that results in 403 — even with a valid
-    cf_clearance cookie.
+    GET the Miruro pipe URL using the persistent ViperTLS session.
+    The CF clearance cookie is already in the session from startup — no
+    extra warmup request is needed.  On 403 (cookie expired) we re-solve
+    once under a lock so concurrent requests don't all spawn browsers.
     """
-    h = dict(HEADERS)
-    cookie = cf_store.get()
-    if cookie and time.time() <= cookie.expires_at:
-        h["User-Agent"] = cookie.user_agent
-        h["Cookie"] = f"cf_clearance={cookie.value}"
-        # Override client hints to match the captured UA — these MUST match
-        if cookie.sec_ch_ua:
-            h["sec-ch-ua"] = cookie.sec_ch_ua
-        if cookie.sec_ch_ua_platform:
-            h["sec-ch-ua-platform"] = f'"{cookie.sec_ch_ua_platform}"'
-    return h
+    try:
+        r = await _pipe_client.get(url, headers=_PIPE_HEADERS)
+        if r.status_code == 200:
+            return r.text.strip()
 
+        if r.status_code == 403:
+            # Cookie expired — one process re-solves while others wait
+            async with _warmup_lock:
+                await _do_warmup()
+            r = await _pipe_client.get(url, headers=_PIPE_HEADERS)
+            if r.status_code == 200:
+                return r.text.strip()
 
-def _headers_debug() -> dict:
-    """Return a sanitized view of _build_headers() for the /cf/test endpoint.
-    Hides the actual cookie value but shows everything else for debugging."""
-    h = _build_headers()
-    out = dict(h)
-    if "Cookie" in out:
-        # Show first 30 chars + length so the user can verify it's being attached
-        c = out["Cookie"]
-        out["Cookie"] = c[:40] + f"... (length={len(c)})"
-    return out
+        raise HTTPException(
+            status_code=r.status_code,
+            detail={
+                "error": "Pipe request blocked",
+                "status": r.status_code,
+                "solved_by": getattr(r, "solved_by", "unknown"),
+                "failure_reason": r.headers.get("x-vipertls-failure-reason"),
+                "body": r.text[:300],
+                "hint": "Cloudflare blocked the request. If this persists, your IP may be on CF's datacenter blocklist — try the manual paste option on the homepage.",
+            },
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"error": "ViperTLS request failed", "detail": str(exc)}
+        )
+
 
 def _proxy_img(url: str) -> str:
     return url
@@ -120,14 +222,10 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    headers = _build_headers()
-    async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=headers)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers), "hint": "Cloudflare blocked the request. Use the homepage 'Get CF Cookie' button to fetch a cf_clearance cookie first."})
-        data = _decode_pipe_response(res.text.strip())
-        _deep_translate(data)
-        return data
+    raw = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    data = _decode_pipe_response(raw)
+    _deep_translate(data)
+    return data
 
 MEDIA_LIST_FIELDS = """
     id
@@ -446,13 +544,12 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
 
   <!-- ── Cloudflare manager ── -->
   <div class="section">
-    <div class="section-head"><h2>Cloudflare Bypass</h2><div class="section-line"></div></div>
+    <div class="section-head"><h2>Cloudflare Bypass (ViperTLS)</h2><div class="section-line"></div></div>
 
     <div class="cf-panel">
       <div class="cf-head">
-        <h2>cf_clearance cookie</h2>
+        <h2>ViperTLS solver status</h2>
         <div class="cf-status">
-          <span class="cf-dot idle" id="cf-dot"></span>
           <span id="cf-status-text">checking…</span>
         </div>
       </div>
@@ -460,13 +557,10 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
       <div class="cf-info" id="cf-info">Loading status…</div>
 
       <div class="cf-row">
-        <button class="cf-btn primary" id="cf-get-btn" onclick="cfGet()">▶ Get CF Cookie</button>
-        <button class="cf-btn danger" id="cf-stop-btn" onclick="cfStop()" disabled>■ Stop Browser</button>
-        <button class="cf-btn warn" id="cf-clear-btn" onclick="cfClear()">✕ Forget Cookie</button>
-        <button class="cf-btn" id="cf-test-btn" onclick="cfTest()" style="background:rgba(56,189,248,.1);color:var(--blue);border-color:rgba(56,189,248,.25)">🧪 Test Cookie</button>
+        <button class="cf-btn primary" id="cf-warmup-btn" onclick="cfWarmup()">🔥 Re-solve CF</button>
+        <button class="cf-btn warn" id="cf-clear-btn" onclick="cfClear()">✕ Forget Manual Cookie</button>
+        <button class="cf-btn" id="cf-test-btn" onclick="cfTest()" style="background:rgba(56,189,248,.1);color:var(--blue);border-color:rgba(56,189,248,.25)">🧪 Test Pipe</button>
       </div>
-
-      <div class="cf-log" id="cf-log"></div>
 
       <div id="cf-test-result" style="margin-top:12px;display:none"></div>
 
@@ -706,54 +800,45 @@ async function cfRefresh(){
   try{
     const r = await fetch('/cf/status');
     const d = await r.json();
-    const solver = d.solver||{};
-    const cookie = d.cookie||{};
+    const vt = d.vipertls||{};
+    const cookie = d.manual_cookie||{};
 
-    const dot = document.getElementById('cf-dot');
     const txt = document.getElementById('cf-status-text');
     const info = document.getElementById('cf-info');
-    const log = document.getElementById('cf-log');
-    const getBtn = document.getElementById('cf-get-btn');
-    const stopBtn = document.getElementById('cf-stop-btn');
     const clearBtn = document.getElementById('cf-clear-btn');
+    const warmupBtn = document.getElementById('cf-warmup-btn');
 
-    // status dot + text
-    const st = solver.status || 'idle';
-    dot.className = 'cf-dot ' + st;
-    const labels = {idle:'idle',running:'running…',success:'success',failed:'failed',stopped:'stopped'};
-    txt.textContent = labels[st] || st;
+    // status text
+    const st = vt.solver_status || {};
+    const lastSolve = st.last_solve || 'never';
+    const warmupRunning = vt.warmup_in_progress;
+    txt.textContent = warmupRunning ? 'solving…' : (st.last_solve ? `last: ${lastSolve}` : 'idle');
 
-    // log
-    if (solver.log && solver.log.length){
-      log.innerHTML = solver.log.map(l=>`<div>${l}</div>`).join('');
-      log.scrollTop = log.scrollHeight;
+    // info block — show vipertls state
+    let html = `<b>ViperTLS:</b> <span class="val">${vt.preset||'?'}</span> · client ${vt.client_active?'✅ active':'❌ inactive'}<br>`;
+    html += `<b>Last solve:</b> <span class="val">${st.last_solve||'never'}</span><br>`;
+    if (st.last_solve_at){
+      const ago = Math.floor((Date.now()/1000) - st.last_solve_at);
+      html += `<b>Last solve ago:</b> <span class="val">${ago}s ago</span><br>`;
     }
+    html += `<b>Solve count:</b> <span class="val">${st.solve_count||0}</span> · <b>Failures:</b> <span class="val">${st.fail_count||0}</span><br>`;
+    if (st.last_failure_reason){
+      html += `<b>Last failure:</b> <span style="color:#fca5a5">${st.last_failure_reason}</span><br>`;
+    }
+    html += `<br><b style="color:var(--blue)">How it works:</b> ViperTLS handles CF bypass automatically — TLS fingerprinting for normal requests, escalates to a real browser solve only when CF challenges. <b>No manual button needed.</b><br>`;
+    info.innerHTML = html;
 
-    // cookie info block
+    // manual cookie section
     if (cookie.has_cookie){
-      const remain = cookie.seconds_remaining || 0;
-      const mins = Math.floor(remain/60), secs = remain%60;
-      info.innerHTML = `<b>Cookie:</b> <span class="val">${cookie.value_preview||''}</span> <span style="color:var(--dim);font-size:.9em">(length=${cookie.value_length||'?'})</span><br>
-        <b>User-Agent:</b> <span class="val" style="font-size:.85em">${(cookie.user_agent||'').slice(0,100)}</span><br>
-        <b>sec-ch-ua:</b> <span class="val" style="font-size:.85em">${cookie.sec_ch_ua||'<span style="color:#ef4444">NOT CAPTURED — re-capture cookie</span>'}</span><br>
-        <b>sec-ch-ua-platform:</b> <span class="val">${cookie.sec_ch_ua_platform||'<span style="color:#ef4444">NOT CAPTURED</span>'}</span><br>
-        <b>Expires in:</b> <span class="val">${mins}m ${secs}s</span> ${cookie.is_expired?'<span style="color:#ef4444">(expired)</span>':'<span style="color:var(--green)">(live)</span>'}`;
+      info.innerHTML += `<br><b>Manual cookie:</b> <span class="val">${cookie.value_preview||''}</span> (length=${cookie.value_length||'?'})`;
       clearBtn.disabled = false;
     } else {
-      info.innerHTML = `<b>No cookie stored.</b> Press <b>Get CF Cookie</b> to launch a browser and capture one automatically, or use the manual paste option below.`;
       clearBtn.disabled = true;
     }
 
-    // button states
-    getBtn.disabled = (st === 'running');
-    stopBtn.disabled = (st !== 'running');
-
-    if (st === 'running'){
+    warmupBtn.disabled = warmupRunning;
+    if (warmupRunning){
       cfPolling.start(cfRefresh, 1500);
-    } else if (st === 'success' || st === 'failed' || st === 'stopped'){
-      // one final refresh in 1s, then stop polling
-      cfPolling.start(cfRefresh, 2000);
-      setTimeout(()=>cfPolling.stop(), 3000);
     }
   }catch(e){
     document.getElementById('cf-status-text').textContent = 'error';
@@ -761,18 +846,12 @@ async function cfRefresh(){
   }
 }
 
-async function cfGet(){
+async function cfWarmup(){
   try{
-    const r = await fetch('/cf/get', {method:'POST'});
+    document.getElementById('cf-status-text').textContent = 'solving…';
+    const r = await fetch('/cf/warmup', {method:'POST'});
     const d = await r.json();
-    if (!d.ok) alert(d.detail || 'Failed to start');
-    cfRefresh();
-  }catch(e){alert('Error: '+e.message)}
-}
-
-async function cfStop(){
-  try{
-    await fetch('/cf/stop', {method:'POST'});
+    if (!d.ok) alert('Warmup failed: ' + (d.message || 'see status'));
     cfRefresh();
   }catch(e){alert('Error: '+e.message)}
 }
@@ -799,11 +878,11 @@ async function cfManual(){
 async function cfTest(){
   const result = document.getElementById('cf-test-result');
   result.style.display = 'block';
-  result.innerHTML = '<div class="cf-info">🧪 Testing cookie against miruro.tv/api/secure/pipe…</div>';
+  result.innerHTML = '<div class="cf-info">🧪 Testing pipe endpoint via ViperTLS…</div>';
   try{
     const r = await fetch('/cf/test');
     const d = await r.json();
-    if (d.error && !d.request_headers){
+    if (d.error && !d.response_status){
       result.innerHTML = `<div class="cf-info" style="border-color:rgba(239,68,68,.3)"><b>❌ Error:</b> ${d.error}</div>`;
       return;
     }
@@ -812,16 +891,15 @@ async function cfTest(){
     const emoji = ok ? '✅' : '❌';
     let html = `<div class="cf-info" style="border-color:${color}40">
       <div style="color:${color};font-weight:600;font-size:1.05em;margin-bottom:10px">${emoji} Response: HTTP ${d.response_status||'?'}</div>
-      <b>Diagnosis:</b> <span style="color:${color}">${d.diagnosis||''}</span><br><br>
-      <b>Request URL:</b><br><span class="val" style="font-size:.7em;word-break:break-all">${d.request_url||''}</span><br><br>
-      <b>Request headers sent to Cloudflare:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.72em;color:#a5b4fc;margin-top:6px;white-space:pre-wrap;word-break:break-all">${JSON.stringify(d.request_headers, null, 2)}</pre>
+      <b>solved_by:</b> <span class="val">${d.solved_by||'unknown'}</span><br>
+      ${d.failure_reason?`<b>failure_reason:</b> <span style="color:#fca5a5">${d.failure_reason}</span><br>`:''}
+      ${d.response_is_cloudflare_challenge?'<b style="color:#fbbf24">⚠️ Cloudflare challenge page returned</b><br>':''}
     `;
-    if (d.response_headers){
+    if (d.response_headers && Object.keys(d.response_headers).length){
       html += `<br><b>Response headers from Cloudflare:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.72em;color:#94a3b8;margin-top:6px;white-space:pre-wrap">${JSON.stringify(d.response_headers, null, 2)}</pre>`;
     }
     if (d.response_body_preview){
-      const isChallenge = d.response_is_cloudflare_challenge;
-      html += `<br><b>Response body preview ${isChallenge?'<span style="color:#fbbf24">(Cloudflare challenge page!)</span>':''}:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.7em;color:#94a3b8;margin-top:6px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all">${(d.response_body_preview||'').replace(/</g,'&lt;')}</pre>`;
+      html += `<br><b>Response body preview:</b><br><pre style="background:rgba(0,0,0,.4);padding:8px;border-radius:6px;font-size:.7em;color:#94a3b8;margin-top:6px;max-height:200px;overflow:auto;white-space:pre-wrap;word-break:break-all">${(d.response_body_preview||'').replace(/</g,'&lt;')}</pre>`;
     }
     html += `</div>`;
     result.innerHTML = html;
@@ -838,100 +916,67 @@ cfRefresh();
 
 
 # ─── Cloudflare management endpoints ────────────────────────────────
+# These are now mostly informational — vipertls handles CF bypass
+# automatically. The manual-paste fallback is kept for environments
+# where vipertls's browser solver fails (e.g. strict datacenter IPs).
 
 class ManualCFPayload(BaseModel):
     value: str
     user_agent: str = ""
-    sec_ch_ua: str = ""
-    sec_ch_ua_platform: str = ""
-
-
-@app.post("/cf/get")
-async def cf_get():
-    """
-    Launch a background browser to solve Cloudflare's challenge and capture
-    cf_clearance. Returns immediately; poll /cf/status for progress.
-    Idempotent: if a fetch is already running, returns its status.
-    """
-    if cf_solver.is_running():
-        return {"ok": True, "message": "Already running", "status": cf_solver.status()}
-    if cf_store.get() and time.time() <= cf_store.get().expires_at:
-        return {"ok": True, "message": "Already have a live cookie", "status": cf_store.status()}
-
-    def on_complete(cookie):
-        cf_store.set(cookie)
-
-    started = cf_solver.start(on_complete=on_complete)
-    return {"ok": started, "status": cf_solver.status()}
 
 
 @app.get("/cf/status")
 async def cf_status():
-    """Combined view of solver state + stored cookie state."""
+    """Show vipertls solver status + any manually-pasted cookie."""
     return {
-        "solver": cf_solver.status(),
-        "cookie": cf_store.status(),
+        "vipertls": {
+            "preset": "chrome_145",
+            "client_active": _pipe_client is not None,
+            "solver_status": _solver_status,
+            "warmup_in_progress": _warmup_lock.locked(),
+        },
+        "manual_cookie": cf_store.status(),
     }
 
 
-@app.post("/cf/stop")
-async def cf_stop():
-    """Kill any running browser process. Stays lightweight after."""
-    killed = cf_solver.stop()
-    return {"ok": True, "killed_pid": killed, "status": cf_solver.status()}
+@app.post("/cf/warmup")
+async def cf_warmup():
+    """Force a re-solve of the Cloudflare challenge now.
+    Useful if /episodes is returning 403 and you want to refresh the
+    cf_clearance cookie without restarting the server."""
+    if _warmup_lock.locked():
+        return {"ok": False, "message": "Warmup already in progress", "status": _solver_status}
+    async with _warmup_lock:
+        ok = await _do_warmup()
+    return {"ok": ok, "status": _solver_status}
 
 
 @app.post("/cf/manual")
 async def cf_manual(payload: ManualCFPayload):
-    """Paste a cf_clearance cookie you captured in your own browser."""
+    """Manually paste a cf_clearance cookie (fallback for environments
+    where vipertls's browser solver fails). Note: this overrides the
+    vipertls session's cookie only for display purposes — vipertls
+    manages its own session internally. For full functionality, deploy
+    on an IP that vipertls can solve from."""
     if not payload.value or len(payload.value) < 20:
         raise HTTPException(status_code=400, detail="value looks invalid (too short)")
-    cf_store.set_manual(
-        payload.value,
-        payload.user_agent,
-        payload.sec_ch_ua,
-        payload.sec_ch_ua_platform,
-    )
+    cf_store.set_manual(payload.value, payload.user_agent)
     return {"ok": True, "cookie": cf_store.status()}
 
 
 @app.delete("/cf/token")
 async def cf_clear():
-    """Forget the stored cookie."""
+    """Forget the manually-pasted cookie."""
     cf_store.clear()
     return {"ok": True, "cookie": cf_store.status()}
 
 
 @app.get("/cf/test")
 async def cf_test():
-    """
-    Live test: fetch the miruro.tv pipe endpoint with the stored cookie and
-    return the EXACT request headers + response status + response body.
-
-    Use this to debug 403 errors. If the request_headers show a Cookie is
-    attached but the response is still 403, then either:
-      1. The cookie is expired or invalidated by Cloudflare (re-capture it)
-      2. The User-Agent / sec-ch-ua don't match what the browser used
-      3. Your IP is on Cloudflare's datacenter blocklist
-    """
-    cookie = cf_store.get()
-    if not cookie:
-        return {
-            "ok": False,
-            "error": "No cookie stored. Click 'Get CF Cookie' first.",
-            "cookie_status": cf_store.status(),
-        }
-
-    if time.time() > cookie.expires_at:
-        return {
-            "ok": False,
-            "error": "Cookie is expired. Click 'Get CF Cookie' to refresh.",
-            "cookie_status": cf_store.status(),
-        }
-
-    # Build the EXACT headers that /episodes/{id} will use
-    headers = _build_headers()
-    # Make a real pipe request (anilist_id=1 — same as /episodes/1)
+    """Live test: hit the miruro pipe endpoint via vipertls and show
+    the response. Useful for debugging 403 errors."""
+    if not _pipe_client:
+        return {"ok": False, "error": "ViperTLS client not initialized yet"}
     payload = {
         "path": "episodes",
         "method": "GET",
@@ -941,66 +986,26 @@ async def cf_test():
     }
     encoded_req = _encode_pipe_request(payload)
     url = f"{MIRURO_PIPE_URL}?e={encoded_req}"
-
-    # Sanitize headers for display (don't leak the full cookie value)
-    display_headers = dict(headers)
-    if "Cookie" in display_headers:
-        c = display_headers["Cookie"]
-        display_headers["Cookie"] = c[:40] + f"... (total length={len(c)})"
-
     try:
-        async with AsyncSession(impersonate="chrome110") as client:
-            res = await client.get(url, headers=headers)
-            # Identify the response type
-            is_cf_challenge = "Just a moment" in res.text or "challenge-platform" in res.text
-            return {
-                "ok": res.status_code == 200,
-                "request_url": url,
-                "request_headers": display_headers,
-                "response_status": res.status_code,
-                "response_is_cloudflare_challenge": is_cf_challenge,
-                "response_body_preview": res.text[:800],
-                "response_headers": {
-                    k: v for k, v in dict(res.headers).items()
-                    if k.lower() in ("server", "cf-ray", "cf-cache-status", "content-type",
-                                     "set-cookie", "cf-mitigated", "cf-chl-bypass")
-                },
-                "cookie_status": cf_store.status(),
-                "diagnosis": _diagnose_403(res.status_code, is_cf_challenge, headers, cookie),
-            }
-    except Exception as e:
+        r = await _pipe_client.get(url, headers=_PIPE_HEADERS)
+        is_challenge = "Just a moment" in r.text or "challenge-platform" in r.text
         return {
-            "ok": False,
-            "error": str(e),
-            "request_headers": display_headers,
-            "cookie_status": cf_store.status(),
+            "ok": r.status_code == 200,
+            "request_url": url,
+            "response_status": r.status_code,
+            "solved_by": getattr(r, "solved_by", "unknown"),
+            "failure_reason": r.headers.get("x-vipertls-failure-reason"),
+            "response_is_cloudflare_challenge": is_challenge,
+            "response_body_preview": r.text[:600],
+            "response_headers": {
+                k: v for k, v in dict(r.headers).items()
+                if k.lower() in ("server", "cf-ray", "cf-cache-status", "content-type",
+                                 "set-cookie", "cf-mitigated", "cf-chl-bypass")
+            },
+            "solver_status": _solver_status,
         }
-
-
-def _diagnose_403(status: int, is_cf_challenge: bool, headers: dict, cookie) -> str:
-    """Return a human-readable diagnosis of why we got 403."""
-    if status == 200:
-        return "✅ Request succeeded — cookie is valid and being used correctly."
-    if status != 403:
-        return f"Got status {status} — check the response body for details."
-    if "Cookie" not in headers:
-        return "❌ No Cookie header attached. The cookie store returned None — click 'Get CF Cookie'."
-    if is_cf_challenge:
-        return ("⚠️ Cloudflare returned its challenge page (not the pipe response). "
-                "This means the cookie was either: (a) captured by a botasaurus bypass that "
-                "Cloudflare detected, OR (b) bound to a different TLS fingerprint than curl_cffi "
-                "is using. Try the 'Manual paste' option with a cookie from your own browser.")
-    # 403 but not the challenge page — could be the cookie was rejected for another reason
-    ua = headers.get("User-Agent", "")
-    sec_ch_ua = headers.get("sec-ch-ua", "")
-    if "Chrome/110" in ua and "151" not in ua:
-        return ("❌ User-Agent says Chrome/110 but the cookie was captured by Chrome/151. "
-                "Mismatch — re-capture the cookie or use Manual paste.")
-    if "v=\"110\"" in sec_ch_ua and "Chrome/151" in ua:
-        return ("❌ sec-ch-ua header says Chrome 110 but User-Agent says Chrome 151. "
-                "Mismatch — re-capture the cookie so sec-ch-ua is updated.")
-    return ("❌ Cloudflare rejected the request. The cookie may be tainted (botasaurus bypass "
-            "detected) or bound to a different TLS fingerprint. Try Manual paste.")
+    except Exception as e:
+        return {"ok": False, "error": str(e), "solver_status": _solver_status}
 
 
 @app.get("/search")
@@ -1433,12 +1438,8 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
-    headers = _build_headers()
-    async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=headers)
-        if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers), "hint": "Cloudflare blocked the request. Use the homepage 'Get CF Cookie' button to fetch a cf_clearance cookie first."})
-        return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
+    raw = await _pipe_get(f"{MIRURO_PIPE_URL}?e={encoded_req}")
+    return _proxy_deep_images(_decode_pipe_response(raw))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
 async def get_watch_sources(provider: str, anilist_id: int, category: str, slug: str):

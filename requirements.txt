@@ -2,6 +2,6 @@ fastapi
 httpx
 uvicorn
 python-dotenv
-curl_cffi
+curl_cffi>=0.7
+vipertls
 pydantic
-botasaurus

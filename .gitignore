@@ -77,3 +77,5 @@ htmlcov/
 *.tar.xz
 *.tar.zst
 ```
+# vipertls browser binaries (installed at runtime/build)
+vipertls/

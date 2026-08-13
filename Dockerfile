@@ -1,32 +1,33 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
+
+# System deps Chromium needs on Debian/Ubuntu (playwright handles these via
+# --with-deps but we also need build tools for some pip packages)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates xvfb xauth \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Install system deps + REAL Google Chrome (not Chrome-for-Testing which CF detects)
-# + Xvfb for headed browser on a server
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    wget gnupg2 ca-certificates \
-    xvfb xauth \
-    && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
-    && apt-get install -y --no-install-recommends /tmp/chrome.deb || true \
-    && apt-get install -yf --no-install-recommends \
-    && rm /tmp/chrome.deb \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
+# Install Python deps first (layer-cached unless requirements change)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
-COPY api.py cf_solver.py cf_store.py ./
+# Install Chromium + all its system libs via playwright's helper.
+# vipertls uses playwright under the hood; VIPERTLS_HOME tells it where to look.
+ENV VIPERTLS_HOME=/app/vipertls
+RUN python -m playwright install-deps chromium && \
+    vipertls install-browsers
 
-# Environment
+# Copy the rest of the project
+COPY api.py cf_store.py ./
+
+# Railway / Render inject PORT at runtime; fall back to 8080 for local Docker.
+ENV PORT=8080
 ENV PYTHONUNBUFFERED=1
-ENV CHROME_PATH=/usr/bin/google-chrome
+# Xvfb display for headed browser solve (vipertls escalates to headed if headless fails)
 ENV DISPLAY=:99
 
-# Expose the default FastAPI port
-EXPOSE 8000
+EXPOSE 8080
 
-# Start Xvfb (for headed Chrome to bypass CF) then uvicorn
-CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & sleep 1 && uvicorn api:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Start Xvfb (for vipertls browser solver) then uvicorn
+CMD ["sh", "-c", "Xvfb :99 -screen 0 1280x800x24 -nolisten tcp & sleep 1 && uvicorn api:app --host 0.0.0.0 --port ${PORT:-8080}"]
