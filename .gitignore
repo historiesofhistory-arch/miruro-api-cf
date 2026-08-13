@@ -27,6 +27,13 @@ build/
 .env.local
 *.env.*
 
+# CF clearance cookie (do NOT commit — it's a secret)
+.cf_clearance.json
+
+# botasaurus artifacts
+output/
+profiles/
+
 # Editor/IDE files
 .vscode/
 .idea/

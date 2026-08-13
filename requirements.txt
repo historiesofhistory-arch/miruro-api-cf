@@ -3,3 +3,5 @@ httpx
 uvicorn
 python-dotenv
 curl_cffi
+pydantic
+botasaurus

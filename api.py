@@ -1,14 +1,18 @@
-import base64, json, gzip, httpx, os
+import base64, json, gzip, httpx, os, time
 from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from dotenv import load_dotenv
+from pydantic import BaseModel
+
+from cf_solver import solver as cf_solver
+from cf_store import store as cf_store
 
 load_dotenv()
 
-app = FastAPI(title="Miruro API", version="2.0")
+app = FastAPI(title="Miruro API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,8 +22,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+BASE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+)
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+    "User-Agent": BASE_USER_AGENT,
     "Referer": "https://www.miruro.tv/",
     "Origin": "https://www.miruro.tv",
     "Accept": "*/*",
@@ -34,6 +43,20 @@ HEADERS = {
 }
 ANILIST_URL = "https://graphql.anilist.co"
 MIRURO_PIPE_URL = "https://www.miruro.tv/api/secure/pipe"
+
+
+def _build_headers() -> dict:
+    """
+    Return a fresh copy of HEADERS, patched with the stored cf_clearance
+    cookie + matching user-agent if we have one. Otherwise return the
+    default headers (which will hit Cloudflare's 403 on datacenter IPs).
+    """
+    h = dict(HEADERS)
+    cookie = cf_store.get()
+    if cookie and time.time() <= cookie.expires_at:
+        h["User-Agent"] = cookie.user_agent
+        h["Cookie"] = f"cf_clearance={cookie.value}"
+    return h
 
 def _proxy_img(url: str) -> str:
     return url
@@ -74,10 +97,11 @@ async def _fetch_raw_episodes(anilist_id: int) -> dict:
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
+    headers = _build_headers()
     async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
+        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=headers)
         if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
+            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers), "hint": "Cloudflare blocked the request. Use the homepage 'Get CF Cookie' button to fetch a cf_clearance cookie first."})
         data = _decode_pipe_response(res.text.strip())
         _deep_translate(data)
         return data
@@ -333,6 +357,40 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
 .footer a{color:var(--blue);text-decoration:none;font-weight:500}
 .footer a:hover{color:var(--purple)}
 
+/* ── CF manager ── */
+.cf-panel{background:linear-gradient(135deg,rgba(251,191,36,.05),rgba(56,189,248,.03));border:1px solid rgba(251,191,36,.18);border-radius:16px;padding:24px;margin-bottom:10px}
+.cf-head{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+.cf-head h2{font-size:.7em;font-weight:600;letter-spacing:.12em;text-transform:uppercase;color:var(--amber)}
+.cf-status{display:flex;align-items:center;gap:8px;font-size:.78em;color:var(--muted);margin-left:auto}
+.cf-dot{width:8px;height:8px;border-radius:50%;background:var(--dim);transition:background .3s}
+.cf-dot.idle{background:var(--dim)}
+.cf-dot.running{background:var(--amber);animation:pulse 1.2s infinite}
+.cf-dot.success{background:var(--green)}
+.cf-dot.failed{background:#ef4444}
+.cf-dot.stopped{background:var(--muted)}
+.cf-row{display:flex;flex-wrap:wrap;gap:10px;margin:14px 0}
+.cf-btn{flex:1;min-width:140px;padding:12px 16px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text);font-family:var(--font);font-size:.85em;font-weight:500;cursor:pointer;transition:all .15s;letter-spacing:.02em}
+.cf-btn:hover:not(:disabled){transform:translateY(-1px);box-shadow:0 6px 20px rgba(0,0,0,.3)}
+.cf-btn:disabled{opacity:.45;cursor:not-allowed}
+.cf-btn.primary{background:rgba(52,211,153,.12);color:var(--green);border-color:rgba(52,211,153,.3)}
+.cf-btn.primary:hover:not(:disabled){background:rgba(52,211,153,.18)}
+.cf-btn.danger{background:rgba(239,68,68,.1);color:#fca5a5;border-color:rgba(239,68,68,.25)}
+.cf-btn.danger:hover:not(:disabled){background:rgba(239,68,68,.18)}
+.cf-btn.warn{background:rgba(251,191,36,.1);color:var(--amber);border-color:rgba(251,191,36,.25)}
+.cf-btn.warn:hover:not(:disabled){background:rgba(251,191,36,.18)}
+.cf-info{background:rgba(0,0,0,.25);border:1px solid var(--border);border-radius:10px;padding:14px 16px;font-size:.78em;color:var(--muted);line-height:1.7}
+.cf-info b{color:var(--text);font-weight:500}
+.cf-info .val{font-family:var(--mono);color:#a5b4fc}
+.cf-log{background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:.72em;color:#94a3b8;max-height:120px;overflow-y:auto;margin-top:10px;line-height:1.6}
+.cf-log:empty::before{content:'No log yet';color:var(--dim);font-style:italic}
+.cf-log div{padding:1px 0}
+.cf-log div:last-child{color:var(--green)}
+.cf-collapse{margin-top:10px}
+.cf-collapse summary{cursor:pointer;font-size:.78em;color:var(--muted);user-select:none}
+.cf-collapse summary:hover{color:var(--text)}
+.cf-collapse textarea{width:100%;margin-top:10px;background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--mono);font-size:.78em;color:var(--text);min-height:64px;resize:vertical}
+.cf-collapse input{width:100%;margin-top:8px;background:rgba(0,0,0,.4);border:1px solid var(--border);border-radius:8px;padding:10px;font-family:var(--mono);font-size:.78em;color:var(--text)}
+
 @media(max-width:600px){
   .wrap{padding:40px 14px 60px}
   .hero{padding:36px 0 44px}
@@ -361,6 +419,43 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
     <h1><span class="grad">Miruro API</span></h1>
     <p class="sub">Reverse-engineered anime streaming API. Episodes, sources, metadata — all in one place.</p>
     <div class="chip">v3.0 &nbsp;·&nbsp; Live</div>
+  </div>
+
+  <!-- ── Cloudflare manager ── -->
+  <div class="section">
+    <div class="section-head"><h2>Cloudflare Bypass</h2><div class="section-line"></div></div>
+
+    <div class="cf-panel">
+      <div class="cf-head">
+        <h2>cf_clearance cookie</h2>
+        <div class="cf-status">
+          <span class="cf-dot idle" id="cf-dot"></span>
+          <span id="cf-status-text">checking…</span>
+        </div>
+      </div>
+
+      <div class="cf-info" id="cf-info">Loading status…</div>
+
+      <div class="cf-row">
+        <button class="cf-btn primary" id="cf-get-btn" onclick="cfGet()">▶ Get CF Cookie</button>
+        <button class="cf-btn danger" id="cf-stop-btn" onclick="cfStop()" disabled>■ Stop Browser</button>
+        <button class="cf-btn warn" id="cf-clear-btn" onclick="cfClear()">✕ Forget Cookie</button>
+      </div>
+
+      <div class="cf-log" id="cf-log"></div>
+
+      <details class="cf-collapse">
+        <summary>Manual paste (advanced — if auto-bypass fails in your env)</summary>
+        <p style="font-size:.78em;color:var(--muted);margin-top:8px;line-height:1.6">
+          Open <a href="https://www.miruro.tv/" target="_blank" style="color:var(--blue)">miruro.tv</a> in your own browser,
+          solve the Cloudflare challenge, then open DevTools → Application → Cookies → <code>cf_clearance</code>.
+          Copy the value (and your browser's User-Agent) below.
+        </p>
+        <textarea id="cf-manual-value" placeholder="paste cf_clearance value here…"></textarea>
+        <input id="cf-manual-ua" placeholder="your browser's User-Agent (optional)">
+        <button class="cf-btn primary" style="margin-top:8px;width:100%" onclick="cfManual()">Save manual cookie</button>
+      </details>
+    </div>
   </div>
 
   <!-- ── search ── -->
@@ -577,9 +672,166 @@ code{font-family:var(--mono);font-size:.85em;color:#a5b4fc;background:rgba(165,1
     el.addEventListener('mouseleave',()=>el.style.transform='');
   });
 })();
+
+/* ── Cloudflare manager ── */
+const cfPolling = {timer:null, stop(){clearInterval(this.timer);this.timer=null}, start(fn,interval=1500){this.stop();this.timer=setInterval(fn,interval);fn()}};
+
+async function cfRefresh(){
+  try{
+    const r = await fetch('/cf/status');
+    const d = await r.json();
+    const solver = d.solver||{};
+    const cookie = d.cookie||{};
+
+    const dot = document.getElementById('cf-dot');
+    const txt = document.getElementById('cf-status-text');
+    const info = document.getElementById('cf-info');
+    const log = document.getElementById('cf-log');
+    const getBtn = document.getElementById('cf-get-btn');
+    const stopBtn = document.getElementById('cf-stop-btn');
+    const clearBtn = document.getElementById('cf-clear-btn');
+
+    // status dot + text
+    const st = solver.status || 'idle';
+    dot.className = 'cf-dot ' + st;
+    const labels = {idle:'idle',running:'running…',success:'success',failed:'failed',stopped:'stopped'};
+    txt.textContent = labels[st] || st;
+
+    // log
+    if (solver.log && solver.log.length){
+      log.innerHTML = solver.log.map(l=>`<div>${l}</div>`).join('');
+      log.scrollTop = log.scrollHeight;
+    }
+
+    // cookie info block
+    if (cookie.has_cookie){
+      const remain = cookie.seconds_remaining || 0;
+      const mins = Math.floor(remain/60), secs = remain%60;
+      info.innerHTML = `<b>Cookie:</b> <span class="val">${cookie.value_preview||''}</span><br>
+        <b>User-Agent:</b> <span class="val">${(cookie.user_agent||'').slice(0,80)}…</span><br>
+        <b>Expires in:</b> <span class="val">${mins}m ${secs}s</span> ${cookie.is_expired?'<span style="color:#ef4444">(expired)</span>':'<span style="color:var(--green)">(live)</span>'}`;
+      clearBtn.disabled = false;
+    } else {
+      info.innerHTML = `<b>No cookie stored.</b> Press <b>Get CF Cookie</b> to launch a browser and capture one automatically, or use the manual paste option below.`;
+      clearBtn.disabled = true;
+    }
+
+    // button states
+    getBtn.disabled = (st === 'running');
+    stopBtn.disabled = (st !== 'running');
+
+    if (st === 'running'){
+      cfPolling.start(cfRefresh, 1500);
+    } else if (st === 'success' || st === 'failed' || st === 'stopped'){
+      // one final refresh in 1s, then stop polling
+      cfPolling.start(cfRefresh, 2000);
+      setTimeout(()=>cfPolling.stop(), 3000);
+    }
+  }catch(e){
+    document.getElementById('cf-status-text').textContent = 'error';
+    console.error(e);
+  }
+}
+
+async function cfGet(){
+  try{
+    const r = await fetch('/cf/get', {method:'POST'});
+    const d = await r.json();
+    if (!d.ok) alert(d.detail || 'Failed to start');
+    cfRefresh();
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function cfStop(){
+  try{
+    await fetch('/cf/stop', {method:'POST'});
+    cfRefresh();
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function cfClear(){
+  try{
+    await fetch('/cf/token', {method:'DELETE'});
+    cfRefresh();
+  }catch(e){alert('Error: '+e.message)}
+}
+
+async function cfManual(){
+  const v = document.getElementById('cf-manual-value').value.trim();
+  const ua = document.getElementById('cf-manual-ua').value.trim();
+  if (!v){alert('Paste a cf_clearance value first');return}
+  try{
+    const r = await fetch('/cf/manual', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({value:v, user_agent:ua})});
+    const d = await r.json();
+    if (!d.ok) alert(d.detail || 'Failed to save');
+    cfRefresh();
+  }catch(e){alert('Error: '+e.message)}
+}
+
+// initial load
+cfRefresh();
 </script>
 </body>
 </html>"""
+
+
+# ─── Cloudflare management endpoints ────────────────────────────────
+
+class ManualCFPayload(BaseModel):
+    value: str
+    user_agent: str = ""
+
+
+@app.post("/cf/get")
+async def cf_get():
+    """
+    Launch a background browser to solve Cloudflare's challenge and capture
+    cf_clearance. Returns immediately; poll /cf/status for progress.
+    Idempotent: if a fetch is already running, returns its status.
+    """
+    if cf_solver.is_running():
+        return {"ok": True, "message": "Already running", "status": cf_solver.status()}
+    if cf_store.get() and time.time() <= cf_store.get().expires_at:
+        return {"ok": True, "message": "Already have a live cookie", "status": cf_store.status()}
+
+    def on_complete(cookie):
+        cf_store.set(cookie)
+
+    started = cf_solver.start(on_complete=on_complete)
+    return {"ok": started, "status": cf_solver.status()}
+
+
+@app.get("/cf/status")
+async def cf_status():
+    """Combined view of solver state + stored cookie state."""
+    return {
+        "solver": cf_solver.status(),
+        "cookie": cf_store.status(),
+    }
+
+
+@app.post("/cf/stop")
+async def cf_stop():
+    """Kill any running browser process. Stays lightweight after."""
+    killed = cf_solver.stop()
+    return {"ok": True, "killed_pid": killed, "status": cf_solver.status()}
+
+
+@app.post("/cf/manual")
+async def cf_manual(payload: ManualCFPayload):
+    """Paste a cf_clearance cookie you captured in your own browser."""
+    if not payload.value or len(payload.value) < 20:
+        raise HTTPException(status_code=400, detail="value looks invalid (too short)")
+    cf_store.set_manual(payload.value, payload.user_agent)
+    return {"ok": True, "cookie": cf_store.status()}
+
+
+@app.delete("/cf/token")
+async def cf_clear():
+    """Forget the stored cookie."""
+    cf_store.clear()
+    return {"ok": True, "cookie": cf_store.status()}
+
 
 @app.get("/search")
 async def search_anime(
@@ -1011,10 +1263,11 @@ async def get_sources(
         "version": "0.1.0",
     }
     encoded_req = _encode_pipe_request(payload)
+    headers = _build_headers()
     async with AsyncSession(impersonate="chrome110") as client:
-        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=HEADERS)
+        res = await client.get(f"{MIRURO_PIPE_URL}?e={encoded_req}", headers=headers)
         if res.status_code != 200:
-            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers)})
+            raise HTTPException(status_code=res.status_code, detail={"status": res.status_code, "body": res.text[:500], "headers": dict(res.headers), "hint": "Cloudflare blocked the request. Use the homepage 'Get CF Cookie' button to fetch a cf_clearance cookie first."})
         return _proxy_deep_images(_decode_pipe_response(res.text.strip()))
 
 @app.get("/watch/{provider}/{anilist_id}/{category}/{slug}")
