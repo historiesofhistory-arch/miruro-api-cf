@@ -1,21 +1,37 @@
 """
-cf_store.py — persistence layer for the captured cf_clearance cookie.
+cf_store.py — persistence layer for a manually-pasted cf_clearance cookie.
 
 Holds the cookie in memory + writes it to disk so it survives a server
-restart. The API reads it back through `get_active_cookie()` which returns
-None if no cookie or if it's expired.
+restart. This is the FALLBACK path — the primary CF bypass is handled
+automatically by ViperTLS. This store only matters if the user manually
+pastes a cookie via the homepage panel or /cf/manual endpoint.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
+from dataclasses import dataclass
 from typing import Optional
 
-from cf_solver import CFCookie
+# cf_clearance cookies typically last ~30 min on Cloudflare's default config.
+# We use 25 min as a conservative TTL for manually-pasted cookies.
+COOKIE_TTL_SECONDS = 25 * 60
 
 _STORE_PATH = os.path.join(os.path.dirname(__file__), ".cf_clearance.json")
+
+
+@dataclass
+class CFCookie:
+    """A cf_clearance cookie + the UA / client hints that earned it."""
+    value: str
+    user_agent: str
+    captured_at: float
+    expires_at: float
+    sec_ch_ua: str = ""
+    sec_ch_ua_platform: str = ""
 
 
 class CFStore:
@@ -34,7 +50,6 @@ class CFStore:
     def get(self) -> Optional[CFCookie]:
         with self._lock:
             if self._cookie and time.time() > self._cookie.expires_at:
-                # Expired — clear and persist removal
                 self._cookie = None
                 self._save_to_disk()
             return self._cookie
@@ -52,13 +67,11 @@ class CFStore:
         sec_ch_ua_platform: str = "",
     ) -> None:
         """Allow a user to paste a cf_clearance they captured in their own browser."""
-        from cf_solver import CFSolver
         # If user_agent contains Chrome/<version>, derive sec_ch_ua from it
         # so the user doesn't have to paste it manually.
         derived_sec_ch_ua = sec_ch_ua
         derived_platform = sec_ch_ua_platform
         if not derived_sec_ch_ua and user_agent:
-            import re
             m = re.search(r"Chrome/(\d+)", user_agent)
             if m:
                 v = m.group(1)
@@ -81,7 +94,7 @@ class CFStore:
                 "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
             ),
             captured_at=time.time(),
-            expires_at=time.time() + CFSolver.COOKIE_TTL_SECONDS,
+            expires_at=time.time() + COOKIE_TTL_SECONDS,
             sec_ch_ua=derived_sec_ch_ua,
             sec_ch_ua_platform=derived_platform,
         )
