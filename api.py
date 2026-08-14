@@ -1,4 +1,4 @@
-import base64, json, gzip, httpx, os, time, asyncio
+import base64, json, gzip, httpx, os, time, asyncio, re
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1412,10 +1412,110 @@ async def get_anime_recommendations(
     }
     return _proxy_deep_images(response)
 
+async def _fetch_anilist_episodes(anilist_id: int) -> dict:
+    """
+    Fetch episode title + thumbnail data from AniList's `streamingEpisodes`
+    field. These come from official sources (Crunchyroll, etc.) and are
+    used to ENRICH miruro's pipe response when an episode is missing a
+    title or thumbnail.
+
+    Returns: {episode_number: {"title": ..., "image": ..., "description": ...}}
+    """
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            streamingEpisodes { title thumbnail url site }
+        }
+    }
+    """
+    try:
+        data = await _anilist_query(gql, {"id": anilist_id})
+        episodes = data.get("Media", {}).get("streamingEpisodes", [])
+        # Crunchyroll titles look like "Episode 130 - Scent of Danger!..."
+        # Extract the episode number and build a lookup table.
+        out: dict[int, dict] = {}
+        for ep in episodes:
+            title = ep.get("title", "")
+            # Try to parse "Episode N - Title" or "Episode N: Title" or "Title - Episode N"
+            m = re.search(r"Episode\s+(\d+)", title, re.IGNORECASE)
+            if not m:
+                # Sometimes the title is just a number
+                m = re.match(r"^\s*(\d+)\b", title)
+            if not m:
+                continue
+            num = int(m.group(1))
+            # Prefer the part after "Episode N - " as the title
+            clean_title = re.sub(r"^Episode\s+\d+\s*[-:]\s*", "", title, flags=re.IGNORECASE).strip()
+            if not clean_title:
+                clean_title = title
+            out[num] = {
+                "title": clean_title,
+                "image": ep.get("thumbnail", ""),
+                "url": ep.get("url", ""),
+                "site": ep.get("site", ""),
+            }
+        return out
+    except Exception:
+        return {}
+
+
+def _enrich_episodes_with_anilist(data: dict, anilist_episodes: dict) -> dict:
+    """
+    Merge AniList's streamingEpisodes data into miruro's pipe response.
+    For each episode in each provider, if title/image is missing or empty,
+    fill it in from AniList's data (matched by episode number).
+    """
+    if not anilist_episodes:
+        return data
+    providers = data.get("providers", {})
+    for provider_name, provider_data in providers.items():
+        if not isinstance(provider_data, dict):
+            continue
+        episodes = provider_data.get("episodes", {})
+        if not isinstance(episodes, dict):
+            continue
+        for category, ep_list in episodes.items():
+            if not isinstance(ep_list, list):
+                continue
+            for ep in ep_list:
+                if not isinstance(ep, dict):
+                    continue
+                num = ep.get("number")
+                if num is None:
+                    continue
+                al = anilist_episodes.get(num)
+                if not al:
+                    continue
+                # Fill missing title
+                if not ep.get("title"):
+                    ep["title"] = al.get("title", "")
+                # Fill missing image/thumbnail
+                if not ep.get("image") and al.get("image"):
+                    ep["image"] = al["image"]
+                # Add a `description` if we have one (miruro pipe often leaves it empty)
+                if not ep.get("description") and al.get("site"):
+                    ep["description"] = f"Source: {al['site']}"
+    return data
+
+
 @app.get("/episodes/{anilist_id}")
 async def get_episodes(anilist_id: int):
-    data = await _fetch_raw_episodes(anilist_id)
-    return _proxy_deep_images(_inject_source_slugs(data, anilist_id))
+    # Fetch from miruro pipe + AniList streamingEpisodes IN PARALLEL
+    # so we don't add latency.
+    pipe_task = asyncio.create_task(_fetch_raw_episodes(anilist_id))
+    al_task = asyncio.create_task(_fetch_anilist_episodes(anilist_id))
+    data, anilist_eps = await asyncio.gather(pipe_task, al_task, return_exceptions=True)
+    # If pipe failed (CF 403 etc), re-raise the original error
+    if isinstance(data, Exception):
+        raise data
+    # If AniList enrichment failed, just use the pipe data alone
+    if isinstance(anilist_eps, Exception):
+        anilist_eps = {}
+    # Inject watch slugs + enrich with AniList episode metadata (titles/thumbnails)
+    data = _inject_source_slugs(data, anilist_id)
+    data = _enrich_episodes_with_anilist(data, anilist_eps)
+    return _proxy_deep_images(data)
 
 @app.get("/sources")
 async def get_sources(
