@@ -25,6 +25,7 @@ import vipertls
 # vipertls's solver fails on a given deployment, the user can still
 # paste a cf_clearance they captured in their own browser).
 from cf_store import store as cf_store
+from anizip import fetch_anizip, cache_stats as anizip_cache_stats
 
 load_dotenv()
 
@@ -1634,6 +1635,86 @@ def _enrich_episodes_with_anilist(data: dict, anilist_episodes: dict) -> dict:
     return data
 
 
+@app.get("/api/episodes/{anilist_id}")
+@app.get("/metadata/{anilist_id}")
+async def get_metadata(anilist_id: int):
+    """
+    Returns episode names, thumbnails, banners, clearlogo + cross-refs
+    for an anime, matched by AniList ID.
+
+    Sources data from AniZip (api.ani.zip) — a free public service that
+    maps AniList IDs to TheTVDB series IDs and returns TVDB artwork URLs
+    (public CDN, no auth needed). No API key required, no rate limit.
+
+    Response shape matches just4anime.online/api/episodes/{id}:
+    {
+      "success": true,
+      "data": {
+        "id": "154587",
+        "malId": 52991,
+        "title": "Frieren: Beyond Journey's End",
+        "titleJa": "葬送のフリーレン",
+        "totalEpisodes": 28,
+        "currentEpisode": 28,
+        "nextAiringEpisode": null,
+        "nextAiringDate": null,
+        "images": [
+          {"coverType": "Banner",    "url": "https://artworks.thetvdb.com/..."},
+          {"coverType": "Poster",    "url": "..."},
+          {"coverType": "Fanart",    "url": "..."},
+          {"coverType": "Clearlogo", "url": "..."}
+        ],
+        "episodes": [
+          {
+            "id": "154587-1",
+            "number": 1,
+            "title": "The Journey's End",
+            "titleJa": "冒険の終わり",
+            "description": "...",
+            "image": "https://artworks.thetvdb.com/banners/v4/episode/9350138/screencap/...",
+            "airDate": "2023-09-29",
+            "duration": 26,
+            "isFiller": false,
+            "rating": "8.02",
+            "hasAired": true
+          },
+          ...
+        ],
+        "mappings": {
+          "anilist_id": 154587,
+          "mal_id": 52991,
+          "thetvdb_id": 424536,
+          "kitsu_id": 46474,
+          "anidb_id": 17617,
+          "imdb_id": "tt22248376",
+          "themoviedb_id": "...",
+          ...
+        }
+      },
+      "meta": {
+        "source": "anizip",
+        "cacheTTL": 604800,
+        "cacheStats": {"entries": N, "ttl_seconds": 604800}
+      }
+    }
+
+    Lightweight: in-memory TTL cache (7 days) — repeat requests are
+    instant. No database, no disk persistence. Designed to handle
+    millions of requests with minimal overhead.
+    """
+    data = await fetch_anizip(anilist_id)
+    return {
+        "success": "error" not in data,
+        "data": data,
+        "meta": {
+            "source": "anizip",
+            "cacheTTL": 604800,
+            "cacheStats": anizip_cache_stats(),
+            "error": data.get("error"),
+        },
+    }
+
+
 @app.get("/episodes/{anilist_id}")
 async def get_episodes(anilist_id: int):
     """
@@ -1642,40 +1723,37 @@ async def get_episodes(anilist_id: int):
 
     Data sources (fetched IN PARALLEL for zero added latency):
     1. Miruro pipe — primary source for episode IDs + stream URLs.
-       Also has titles/thumbnails for popular anime. (CF-protected,
-       needs ViperTLS solver to work.)
-    2. TheTVDB — richest episode data (titles, thumbnails, summaries,
-       air dates, filler flags). Requires TVDB_API_KEY env var.
-       Get a free key at https://thetvdb.com/settings/api
-    3. AniList streamingEpisodes — fallback for titles/thumbnails
-       from Crunchyroll. No key needed but partial coverage.
+       (CF-protected, needs ViperTLS solver to work.)
+    2. AniZip — free public AniList→TVDB mapping service. Returns
+       episode titles, thumbnails, summaries, air dates, filler flags,
+       AND series artwork (banner, poster, fanart, clearlogo).
+       No API key, no rate limit, cached for 7 days in-memory.
 
-    Enrichment priority: pipe > TVDB > AniList. Existing data in the
-    pipe response is NEVER overwritten — only empty fields are filled.
+    Enrichment priority: pipe > AniZip. Existing data in the pipe
+    response is NEVER overwritten — only empty fields are filled.
     """
-    # Fetch all 3 sources IN PARALLEL
+    # Fetch pipe + AniZip IN PARALLEL
     pipe_task = asyncio.create_task(_fetch_raw_episodes(anilist_id))
-    tvdb_task = asyncio.create_task(_fetch_tvdb_episodes(anilist_id))
-    al_task = asyncio.create_task(_fetch_anilist_episodes(anilist_id))
-    data, tvdb_eps, anilist_eps = await asyncio.gather(
-        pipe_task, tvdb_task, al_task, return_exceptions=True
-    )
+    anizip_task = asyncio.create_task(fetch_anizip(anilist_id))
+    data, anizip_data = await asyncio.gather(pipe_task, anizip_task, return_exceptions=True)
     # If pipe failed (CF 403 etc), re-raise the original error
     if isinstance(data, Exception):
         raise data
-    # Gracefully handle enrichment failures
-    if isinstance(tvdb_eps, Exception):
-        tvdb_eps = {}
-    if isinstance(anilist_eps, Exception):
-        anilist_eps = {}
+    # Gracefully handle AniZip failure (just use pipe data alone)
+    if isinstance(anizip_data, Exception) or not anizip_data or "error" in anizip_data:
+        anizip_data = {"episodes": []}
     # Inject watch slugs
     data = _inject_source_slugs(data, anilist_id)
-    # Enrich: TVDB first (richest data), then AniList as fallback
-    # (only fills EMPTY fields — never overwrites pipe data)
-    if tvdb_eps:
-        data = _enrich_episodes_with_anilist(data, tvdb_eps)
-    if anilist_eps:
-        data = _enrich_episodes_with_anilist(data, anilist_eps)
+    # Enrich with AniZip episode metadata (only fills EMPTY fields)
+    anizip_eps = {ep["number"]: ep for ep in anizip_data.get("episodes", []) if "number" in ep}
+    if anizip_eps:
+        data = _enrich_episodes_with_anilist(data, anizip_eps)
+    # Also attach the AniZip series images (banner, poster, etc.) at top level
+    # so the frontend can use them without a separate API call.
+    if anizip_data.get("images"):
+        data["seriesImages"] = anizip_data["images"]
+    if anizip_data.get("mappings"):
+        data["mappings"] = anizip_data["mappings"]
     return _proxy_deep_images(data)
 
 @app.get("/sources")
