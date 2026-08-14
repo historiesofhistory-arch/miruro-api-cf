@@ -326,7 +326,7 @@ MEDIA_FULL_FIELDS = """
             }
         }
     }
-    externalLinks { url site type }
+    externalLinks { url site type language color icon }
     streamingEpisodes { title thumbnail url site }
     stats {
         scoreDistribution { score amount }
@@ -1270,6 +1270,45 @@ async def get_anime_info(anilist_id: int):
         raise HTTPException(status_code=404, detail="Anime not found")
     return _proxy_deep_images(media)
 
+@app.get("/anime/{anilist_id}/streaming")
+async def get_anime_streaming(anilist_id: int):
+    """
+    Returns the official streaming provider URLs (Crunchyroll, Netflix,
+    Hulu, etc.) for an anime, with brand color + icon.
+
+    These are the SAME direct URLs AniList uses on its anime pages —
+    they point to the series page on each streaming service (NOT
+    individual episodes). Pair with /episodes/{id} for episode-level
+    stream URLs from miruro's providers (kiwi, arc, zoro, etc.).
+
+    Also includes `externalLinks` of type INFO/SOCIAL (official site,
+    MAL, Wikipedia, etc.) for completeness.
+    """
+    gql = """
+    query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+            id
+            title { romaji english native }
+            externalLinks { url site type language color icon }
+        }
+    }
+    """
+    data = await _anilist_query(gql, {"id": anilist_id})
+    media = data.get("Media")
+    if not media:
+        raise HTTPException(status_code=404, detail="Anime not found")
+    # Split into streaming vs other (info/social)
+    all_links = media.get("externalLinks", [])
+    streaming = [l for l in all_links if l.get("type") == "STREAMING"]
+    info = [l for l in all_links if l.get("type") != "STREAMING"]
+    return {
+        "id": media["id"],
+        "title": media["title"],
+        "streaming": streaming,
+        "external": info,
+    }
+
+
 @app.get("/anime/{anilist_id}/characters")
 async def get_anime_characters(
     anilist_id: int,
@@ -1412,6 +1451,102 @@ async def get_anime_recommendations(
     }
     return _proxy_deep_images(response)
 
+# ── TheTVDB enrichment (optional) ───────────────────────────────────
+# TheTVDB has the most complete episode data (titles, thumbnails, summaries,
+# air dates, filler flags) for anime. Requires a free API key from
+# https://thetvdb.com/settings/api. Set TVDB_API_KEY env var to enable.
+# If not set, falls back to AniList streamingEpisodes (partial coverage).
+
+_tvdb_token: Optional[str] = None
+_tvdb_token_expires: float = 0.0
+
+
+async def _tvdb_login() -> Optional[str]:
+    """Login to TheTVDB API v4 and cache the JWT token."""
+    global _tvdb_token, _tvdb_token_expires
+    api_key = os.environ.get("TVDB_API_KEY")
+    if not api_key:
+        return None
+    # Reuse cached token if still valid (TVDB tokens last ~24h)
+    if _tvdb_token and time.time() < _tvdb_token_expires:
+        return _tvdb_token
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.post(
+                "https://api4.thetvdb.com/v4/login",
+                json={"apikey": api_key},
+            )
+            if res.status_code == 200:
+                _tvdb_token = res.json()["data"]["token"]
+                _tvdb_token_expires = time.time() + 23 * 3600  # 23h
+                return _tvdb_token
+    except Exception:
+        pass
+    return None
+
+
+async def _fetch_tvdb_episodes(anilist_id: int) -> dict:
+    """
+    Fetch episode data from TheTVDB by looking up the series via AniList ID.
+    Returns: {episode_number: {"title": ..., "image": ..., "description": ..., "airDate": ...}}
+    Returns {} if TVDB_API_KEY not set or lookup fails.
+    """
+    token = await _tvdb_login()
+    if not token:
+        return {}
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Step 1: find the TVDB series by AniList ID
+            # TVDB v4 supports searching by external ID via the /v4/search endpoint
+            search_res = await client.get(
+                "https://api4.thetvdb.com/v4/search",
+                params={"query": str(anilist_id), "remote_id_source": "anilist", "type": "series"},
+                headers=headers,
+            )
+            if search_res.status_code != 200:
+                return {}
+            search_data = search_res.json().get("data", [])
+            if not search_data:
+                return {}
+            tvdb_series_id = search_data[0].get("tvdb_id") or search_data[0].get("id")
+            if not tvdb_series_id:
+                return {}
+
+            # Step 2: fetch all episodes for this series
+            ep_res = await client.get(
+                f"https://api4.thetvdb.com/v4/series/{tvdb_series_id}/episodes/default",
+                params={"page": 0, "lang": "eng"},
+                headers=headers,
+            )
+            if ep_res.status_code != 200:
+                return {}
+            episodes_data = ep_res.json().get("data", {}).get("episodes", [])
+            if not episodes_data:
+                return {}
+
+            out: dict[int, dict] = {}
+            for ep in episodes_data:
+                num = ep.get("number")
+                if num is None:
+                    continue
+                # TVDB episode images are at artworks.thetvdb.com
+                image = ""
+                if ep.get("image"):
+                    image = f"https://artworks.thetvdb.com/banners/{ep['image']}"
+                out[num] = {
+                    "title": ep.get("name", "") or "",
+                    "image": image,
+                    "description": ep.get("overview", "") or "",
+                    "airDate": ep.get("aired", "") or "",
+                    "runtime": ep.get("runtime", 0) or 0,
+                    "filler": ep.get("isFake", False) if "isFake" in ep else False,
+                }
+            return out
+    except Exception:
+        return {}
+
+
 async def _fetch_anilist_episodes(anilist_id: int) -> dict:
     """
     Fetch episode title + thumbnail data from AniList's `streamingEpisodes`
@@ -1501,20 +1636,46 @@ def _enrich_episodes_with_anilist(data: dict, anilist_episodes: dict) -> dict:
 
 @app.get("/episodes/{anilist_id}")
 async def get_episodes(anilist_id: int):
-    # Fetch from miruro pipe + AniList streamingEpisodes IN PARALLEL
-    # so we don't add latency.
+    """
+    Returns all episodes across all providers (kiwi, arc, zoro, etc.)
+    with enriched metadata (titles, thumbnails, descriptions).
+
+    Data sources (fetched IN PARALLEL for zero added latency):
+    1. Miruro pipe — primary source for episode IDs + stream URLs.
+       Also has titles/thumbnails for popular anime. (CF-protected,
+       needs ViperTLS solver to work.)
+    2. TheTVDB — richest episode data (titles, thumbnails, summaries,
+       air dates, filler flags). Requires TVDB_API_KEY env var.
+       Get a free key at https://thetvdb.com/settings/api
+    3. AniList streamingEpisodes — fallback for titles/thumbnails
+       from Crunchyroll. No key needed but partial coverage.
+
+    Enrichment priority: pipe > TVDB > AniList. Existing data in the
+    pipe response is NEVER overwritten — only empty fields are filled.
+    """
+    # Fetch all 3 sources IN PARALLEL
     pipe_task = asyncio.create_task(_fetch_raw_episodes(anilist_id))
+    tvdb_task = asyncio.create_task(_fetch_tvdb_episodes(anilist_id))
     al_task = asyncio.create_task(_fetch_anilist_episodes(anilist_id))
-    data, anilist_eps = await asyncio.gather(pipe_task, al_task, return_exceptions=True)
+    data, tvdb_eps, anilist_eps = await asyncio.gather(
+        pipe_task, tvdb_task, al_task, return_exceptions=True
+    )
     # If pipe failed (CF 403 etc), re-raise the original error
     if isinstance(data, Exception):
         raise data
-    # If AniList enrichment failed, just use the pipe data alone
+    # Gracefully handle enrichment failures
+    if isinstance(tvdb_eps, Exception):
+        tvdb_eps = {}
     if isinstance(anilist_eps, Exception):
         anilist_eps = {}
-    # Inject watch slugs + enrich with AniList episode metadata (titles/thumbnails)
+    # Inject watch slugs
     data = _inject_source_slugs(data, anilist_id)
-    data = _enrich_episodes_with_anilist(data, anilist_eps)
+    # Enrich: TVDB first (richest data), then AniList as fallback
+    # (only fills EMPTY fields — never overwrites pipe data)
+    if tvdb_eps:
+        data = _enrich_episodes_with_anilist(data, tvdb_eps)
+    if anilist_eps:
+        data = _enrich_episodes_with_anilist(data, anilist_eps)
     return _proxy_deep_images(data)
 
 @app.get("/sources")
